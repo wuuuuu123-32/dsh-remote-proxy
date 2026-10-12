@@ -1,0 +1,16 @@
+{
+  "name": "dsh-remote-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Expose your DSH desktop app to your phone via Tailscale, with automatic login",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node proxy.mjs",
+    "setup": "node setup.mjs",
+    "check": "node check.mjs"
+  },
+  "license": "MIT"
+}

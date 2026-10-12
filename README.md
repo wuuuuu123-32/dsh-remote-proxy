@@ -1,0 +1,177 @@
+# dsh-remote-proxy
+
+> 用 Tailscale 把电脑上的 **DSH 桌面端** 安全地开放给手机 —— 免费、HTTPS、可装 PWA、**手机不用带 token**。
+
+DSH（DeepSeek Harness）桌面端内置的 Web 服务只监听 `127.0.0.1:19387`，手机够不着。
+Tailscale 能把请求从外面送进来，但还有两个拦路虎，这个小代理一次解决：
+
+1. **403：DSH 的信任栅栏** —— 它检查 Host 头，默认只放行 `127.0.0.1` 和局域网 IP，`xxx.ts.net` 会被拒。
+2. **无限 303：跨站导航丢掉 cookie** —— 从微信/短信点开链接属于跨站导航，浏览器不会带上
+   `SameSite=Strict` 的登录 cookie，于是来回跳转直到 `ERR_TOO_MANY_REDIRECTS`。
+
+## 原理
+
+```
+手机浏览器
+  └─ https://<机器名>.<tailnet>.ts.net     ← Tailscale 自动签发 TLS 证书
+       │  （加密隧道，只在你自己登录的设备之间）
+       ▼
+  电脑上的 Tailscale 客户端
+       └─ tailscale serve → http://127.0.0.1:3080
+                              │
+                              ▼
+                        proxy.mjs（本仓库）
+                          · 原样转发给 DSH，Host 透传
+                          · 用 DSH 自己的密钥签一个登录 cookie 替手机带上
+                          · 401 时换新 cookie 自己重取一次（浏览器侧零跳转 → 不可能循环）
+                              │
+                              ▼
+                        DSH 桌面端 127.0.0.1:19387
+```
+
+**关键点：DSH 完全不用改监听地址**，仍然只听回环。是 Tailscale 在本地帮它做了 HTTPS 反代。
+
+## 前置条件
+
+- **DSH 桌面端**（本项目在 `0.2.0-rc.2` 上验证通过）
+- **Tailscale**（个人版免费，最多 100 台设备）
+- **Node.js 18+**
+
+## 快速开始
+
+### 1. 装 Tailscale（电脑 + 手机，登录同一个账号）
+
+- 电脑：https://tailscale.com/download
+- 手机：应用商店搜 **Tailscale**
+
+**两边必须在同一个 tailnet（同一账号）**，否则互相看不见。
+
+### 2. 开启 HTTPS 并启动 serve
+
+```bash
+tailscale serve --bg 3080
+```
+
+第一次跑会弹出同意页面引导你开启 HTTPS。成功后它会打印你的访问域名：
+
+```
+https://<机器名>.<tailnet>.ts.net
+```
+
+> Windows 上这一步通常需要**管理员权限**的终端。
+
+### 3. 让 DSH 接受这个域名
+
+编辑 DSH profile 的 `cordis.patch.yml`（通常在 `~/.dsh/profiles/<profile>/cordis.patch.yml`），
+在 `web-runtime` 条目里加 `trustedHosts`：
+
+```yaml
+- id: web-runtime
+  name: "@deepseek-ai/dsh-web-app"
+  config:
+    openBrowser: false
+    printUrl: true
+    surfaceContext: true
+    trustedHosts:
+      - <机器名>.<tailnet>.ts.net
+```
+
+> ⚠️ profile patch 是**整段替换** config，所以要连同已有的键一起保留，不能只写 `trustedHosts`。
+> ⚠️ 改这个文件前先备份 —— 写坏了 DSH 会起不来。
+
+**然后重启 DSH 桌面端。**
+
+### 4. 启动代理
+
+```bash
+node setup.mjs      # 先自检，看还差哪一步
+node proxy.mjs      # 启动代理
+```
+
+Windows 上双击 `start-proxy.cmd` 也行（要保持窗口开着）。
+
+### 5. 手机打开
+
+```
+https://<机器名>.<tailnet>.ts.net/
+```
+
+**不需要 token** —— 代理会自动帮你登录，并种一个 30 天有效的 cookie。
+
+想当 App 用：用浏览器菜单「添加到主屏幕」（iPhone 必须用 **Safari**，Chrome 不支持）。
+
+## 验证
+
+两个脚本，用途不同：
+
+```bash
+node setup.mjs    # 装机自检：7 项逐一检查，告诉你还差哪一步
+node check.mjs    # 链路自检：实测手机入口是否真的通到桌面端
+```
+
+`setup.mjs` 的输出长这样：
+
+```
+DSH 远程访问自检
+─────────────────────────────────────────────
+  ✓ Tailscale 客户端    C:\Program Files\Tailscale\tailscale.exe
+  ✓ 访问域名             <机器名>.<tailnet>.ts.net
+  ✓ DSH 凭据文件         C:\Users\you\.dsh\.credentials.yaml
+  ✓ DSH 桌面端 :19387   在监听
+  ✓ 本代理 :3080        已在运行
+  ✓ tailscale serve   已指向 3080
+  ✓ profile 信任白名单   desktop 已包含该域名
+─────────────────────────────────────────────
+
+全部就绪 ✓  手机打开：https://<机器名>.<tailnet>.ts.net/
+```
+
+`check.mjs` 会实测四条：新手机（无 cookie）、残留旧 cookie、本机直连、对话的实时通道（WSS）。
+期望看到 `HTTP 200` + `set-cookie=有`，以及 `101 Switching Protocols`。
+
+## 环境变量
+
+全部有默认值，**通常一个都不用设**。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DSH_AUTHORITY` | 自动探测 | 访问域名。探测方式：`tailscale status --json` 的 `Self.DNSName` |
+| `DSH_REMOTE_PORT` | `3080` | 代理监听端口（要和 `tailscale serve` 的目标一致） |
+| `DSH_TARGET_PORT` | `19387` | DSH 桌面端 Web 端口 |
+| `DSH_HOME` | `~/.dsh` | DSH 数据目录 |
+| `DSH_CREDENTIALS` | `<DSH_HOME>/.credentials.yaml` | 凭据文件路径 |
+
+## 排错
+
+| 症状 | 原因 / 解决 |
+|---|---|
+| 自检说「探测失败」 | Tailscale 没装或没登录。托盘图标右键 → Log in |
+| 手机打开 **403** | profile 没配 `trustedHosts`，或域名写错。改完要**重启 DSH** |
+| 手机打开 **502** | 代理活着但 DSH 桌面端没开 |
+| **证书错误** | HTTPS 没启用。跑一次不带 `--bg` 的 `tailscale serve` 走完同意流程 |
+| 手机打不开页面 | 手机 Tailscale 没开，或没登同一账号 |
+| **无限跳转 303** | 还有旧版代理在跑。结束掉旧 node 进程后重启 |
+| 界面残缺（没输入框） | 浏览器缓存了旧前端壳。代理已对 HTML 加 `no-store`，硬刷新一次 |
+| serve 重启后失效 | 重新跑 `tailscale serve --bg 3080` |
+
+## 安全性
+
+- **代理只监听 `127.0.0.1`**，不向局域网暴露任何端口。关掉 Tailscale 就完全够不着。
+- **只对匹配域名的 Host 签 cookie**，其它 Host 一律不签，交给 DSH 自己的信任栅栏处理。
+- **密钥不外传**：从本地凭据文件读，只用于本地签 cookie，不发往任何第三方。
+- **数据路径只在你自己的设备之间**，不经过任何中继服务器（除 Tailscale 打洞失败时的官方 DERP 中继，端到端加密）。
+
+> 隐私提醒：启用 Tailscale HTTPS 后，你的**机器名**和 tailnet 名会出现在公开的证书透明度（CT）账本里。
+> 机器名含敏感信息的话，先去 https://console.tailscale.com/admin/machines 改名。
+
+## 已知限制
+
+- **依赖 DSH 的内部实现** —— cookie 签名格式（`v1.<payload>.<hmac>`）和凭据文件里
+  `client-connection/browser-session` 的结构都不是公开 API，**DSH 升级后可能失效**。
+- **只在 Windows + DSH 桌面端 `0.2.0-rc.2` 上实测过**。代码本身没有平台相关的依赖
+  （macOS / Linux 的 tailscale 路径也都考虑了），但这两个平台**没有实测**。
+- 手机上看到的是 **DSH 原生桌面布局**，会挤一些。这个工具只管网络，不管界面。
+
+## 许可
+
+MIT
