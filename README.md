@@ -105,7 +105,7 @@ https://<机器名>.<tailnet>.ts.net/
 两个脚本，用途不同：
 
 ```bash
-node setup.mjs    # 装机自检：7 项逐一检查，告诉你还差哪一步
+node setup.mjs    # 装机自检：8 项逐一检查，告诉你还差哪一步
 node check.mjs    # 链路自检：实测手机入口是否真的通到桌面端
 ```
 
@@ -121,6 +121,7 @@ DSH 远程访问自检
   ✓ 本代理 :3080        已在运行
   ✓ tailscale serve   已指向 3080
   ✓ profile 信任白名单   desktop 已包含该域名
+  ✓ Tailscale 控制平面   已连接，IP 已钉死（192.200.0.109）
 ─────────────────────────────────────────────
 
 全部就绪 ✓  手机打开：https://<机器名>.<tailnet>.ts.net/
@@ -153,6 +154,49 @@ DSH 远程访问自检
 | **无限跳转 303** | 还有旧版代理在跑。结束掉旧 node 进程后重启 |
 | 界面残缺（没输入框） | 浏览器缓存了旧前端壳。代理已对 HTML 加 `no-store`，硬刷新一次 |
 | serve 重启后失效 | 重新跑 `tailscale serve --bg 3080` |
+| **手机显示电脑「离线 / 断联」**，电脑上一切正常 | Tailscale 连不上协调服务器（见下节）。`node setup.mjs` 第 8 项会报红 |
+
+## 手机显示电脑离线，电脑上却一切正常
+
+**症状**：手机端 Tailscale 把电脑标成 offline，但在电脑上自检 8 项全绿、`tailscale serve status`
+也正常、浏览器打开自己那个 `*.ts.net` 域名还是 200。
+
+**原因**：`tailscale serve` 和 MagicDNS 走的是**本地回环**，压根不经过 Tailscale 的协调服务器；
+而「手机能不能看到电脑在线」靠的正是协调服务器。有些校园网 / 企业网只放行了
+`controlplane.tailscale.com` 的**部分 IP**，tailscaled 挑中其它 IP 就永远建不上连接，
+云端于是把你标成 offline —— 本地一切正常，远端全断。
+
+换个网络通常立刻恢复；但在固定网络（宿舍、公司）下它会**反复复发**：连接一断，
+tailscaled 重新挑 IP，挑不中就又是几十分钟不通。
+
+**判据**（`node setup.mjs` 第 8 项会自动查，也可以手动看）：
+
+```bash
+tailscale status --json     # Health 里出现 "Unable to connect to the Tailscale coordination server" 即是
+```
+
+**根治：把能通的那个 IP 钉死**。Windows 上编辑 `C:\Windows\System32\drivers\etc\hosts`（需管理员）：
+
+```
+# Tailscale controlplane: this network only allows one of its IPs (measured 2026-10-16)
+192.200.0.109	controlplane.tailscale.com
+```
+
+```powershell
+ipconfig /flushdns
+Restart-Service Tailscale -Force
+```
+
+怎么知道该钉哪个：把 `controlplane.tailscale.com` 解析出来的 8 个 IPv4 逐个连一下 443 端口，
+留下能通的那个。
+
+> ⚠️ 这个 IP **不保证长期有效**（对方会调整）。自检第 8 项显示绿色即为当前有效；哪天变红，
+> 重新测一遍再改 hosts。
+
+> ⚠️ 验证 hosts 是否生效请用 `ping controlplane.tailscale.com` 或
+> `[System.Net.Dns]::GetHostAddresses('controlplane.tailscale.com')`，
+> **不要用 `Resolve-DnsName -DnsOnly`** —— 那个参数的字面意思就是绕过 hosts 只查 DNS，
+> 返回一堆轮询 IP，看着像失效。
 
 ## 安全性
 
