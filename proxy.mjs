@@ -103,10 +103,16 @@ function cookieHeader(authority) {
   return `${cookieName(authority)}=${mintCookie(authority)}; Max-Age=${maxAge}; Path=/; Expires=${expires}; SameSite=Lax; HttpOnly; Secure`;
 }
 
-/** 把 Cookie 头里同名的那条替换成我们签的（避免浏览器残留的旧 cookie 排在前面被 DSH 先取到）。 */
+/**
+ * 用我们签的 cookie 覆盖掉所有 dsh-auth-* 条目。
+ *
+ * ❗过滤的是**整个前缀**而不是同名项：DSH 按「请求 Host」算 cookie 名，
+ * 浏览器手里那枚是域名 authority 签的、名字不同，留着会被 DSH 当成另一个会话的凭据，
+ * 而且它排在前面时我们追加的同名项可能取不到。统一只留一枚回环 authority 的。
+ */
 function withCookie(headerValue, name, value) {
   const kept = typeof headerValue === 'string'
-    ? headerValue.split(';').map((s) => s.trim()).filter((s) => s !== '' && !s.startsWith(name + '='))
+    ? headerValue.split(';').map((s) => s.trim()).filter((s) => s !== '' && !s.startsWith('dsh-auth-'))
     : [];
   kept.push(name + '=' + value);
   return kept.join('; ');
@@ -128,15 +134,18 @@ function handle(req, res) {
     );
     return;
   }
-  const name = cookieName(authority);
+  // ❗0.2.1 起 DSH 的 /api 与 WebSocket 一样只认「回环 Host + 回环 Origin + authority 为回环的 cookie」：
+  // 域名 Host 的 HTTP 请求会被 403（页面 HTML 本身却放行），表现是「界面壳能打开、对话和数据全空」。
+  // 所以普通请求也必须把三者改写成回环；来源 Host 上面已经校验过，改写是安全的。
+  const loop = '127.0.0.1:' + targetPort;
+  const name = cookieName(loop);
 
-  // 客户端已带着我们的 cookie：原样转发。
-  // 没带（新设备、清了数据、cookie 过期）：由代理补一个再转发 —— 浏览器侧零跳转，不可能循环。
+  // 每次都重签：客户端那枚是域名 authority 签的，DSH 按 Host 找回环名，原样转发必然对不上。
   const prepareHeaders = (base) => {
     const headers = { ...base };
-    if (name !== undefined && !hasCookie(headers.cookie, name)) {
-      headers.cookie = withCookie(headers.cookie, name, mintCookie(authority));
-    }
+    headers.host = loop;
+    if (headers.origin !== undefined) headers.origin = 'http://' + loop;
+    headers.cookie = withCookie(headers.cookie, name, mintCookie(loop));
     return headers;
   };
 
@@ -153,14 +162,13 @@ function handle(req, res) {
       const isGetIndex = req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'));
       if (pres.statusCode === 401 && name !== undefined && !retried && isGetIndex) {
         pres.resume();
-        forward({ ...headers, cookie: withCookie(undefined, name, mintCookie(authority)) }, true);
+        forward({ ...headers, cookie: withCookie(undefined, name, mintCookie(loop)) }, true);
         return;
       }
       const out = { ...pres.headers };
-      const existing = asArray(out['set-cookie']);
-      if (name !== undefined && !existing.some((line) => line.startsWith(name + '='))) {
-        out['set-cookie'] = [...existing, cookieHeader(authority)];
-      }
+      // 上游种的 cookie 绑的是回环 authority，浏览器带回来也用不上 —— 剥掉，只发域名这一份。
+      const existing = asArray(out['set-cookie']).filter((line) => !line.startsWith('dsh-auth-'));
+      out['set-cookie'] = [...existing, cookieHeader(authority)];
       // 页面 HTML 一律不缓存：DSH 自己不发 cache-control，浏览器留着旧版本前端壳时，
       // 换版本后会拿旧资源名去请求（404）→ 界面残缺（例如没有输入框）。带 hash 的静态资源不用管。
       if (typeof out['content-type'] === 'string' && out['content-type'].startsWith('text/html')) {

@@ -63,6 +63,27 @@ function getLocal(cookieValue) {
   });
 }
 
+/**
+ * ❗数据接口探针：0.2.1 起 DSH 的 /api 只认回环 Host，域名 Host 一律 403 ——
+ * 症状是「页面壳能打开、对话列表和一切数据空白」，而首页本身仍是 200。
+ * 所以必须单独探一条真实 API，只看首页会漏掉这个故障。
+ */
+function apiProbe(path) {
+  return new Promise((resolve) => {
+    const req = https.request(
+      { host: AUTHORITY, port: 443, path, method: 'POST', headers: { Host: AUTHORITY, 'content-type': 'application/json' }, servername: AUTHORITY },
+      (res) => {
+        let b = '';
+        res.on('data', (c) => (b += c));
+        res.on('end', () => resolve(`HTTP ${res.statusCode} ${b.slice(0, 48).replace(/\s+/g, ' ')}`));
+      }
+    );
+    req.on('error', (e) => resolve('失败 ' + (e.code ?? e.message)));
+    req.setTimeout(15000, () => { req.destroy(); resolve('超时'); });
+    req.end('{}');
+  });
+}
+
 function wsProbe() {
   return new Promise((resolve) => {
     const sock = tls.connect({ host: AUTHORITY, port: 443, servername: AUTHORITY }, () => {
@@ -88,3 +109,4 @@ console.log('  无 cookie（模拟新手机）       ->', await getHttps(undefin
 console.log('  带伪造的同名旧 cookie         ->', await getHttps(NAME + '=v1.bogus.bogus'));
 console.log(`  本机 127.0.0.1:${LISTEN_PORT} 无 cookie ->`, await getLocal(undefined));
 console.log('  WSS /api/remote.mux           ->', await wsProbe());
+console.log('  POST /api/session/list        ->', await apiProbe('/api/session/list'), '  ← 403 就是「对话和数据全空」');

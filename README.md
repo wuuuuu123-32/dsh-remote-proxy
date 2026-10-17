@@ -21,7 +21,7 @@ Tailscale 能把请求从外面送进来，但还有两个拦路虎，这个小�
                               │
                               ▼
                         proxy.mjs（本仓库）
-                          · 原样转发给 DSH，Host 透传
+                          · 转发前把 Host/Origin 换成回环，并换签回环 cookie
                           · 用 DSH 自己的密钥签一个登录 cookie 替手机带上
                           · 401 时换新 cookie 自己重取一次（浏览器侧零跳转 → 不可能循环）
                               │
@@ -42,14 +42,21 @@ DSH 桌面端 0.2.0 及更早固定监听 `19387`；**0.2.1 起改为系统分�
 
 所以 DSH 升级、重启换端口，代理这边都不用改。
 
-### WebSocket 也要过一次改写
+### 为什么每个请求都要改写成回环 Host
 
-对话的实时通道是 `/api/remote.mux` 的 WebSocket。实测 DSH 对它比对普通 HTTP 更严：
-**只认「回环 Host + 回环 Origin + authority 为回环的 cookie」**，域名 Host/Origin 即使在
-`trustedHosts` 里也一律 `403 forbidden`。所以代理在 `upgrade` 时把这三样统一改写成回环 ——
-来源 Host 在上一步已经校验过，改写不会放宽任何外部可达性。
+0.2.1 起，DSH 对**数据面**的栅栏比页面更严：`/api/*` 和 WebSocket 都
+**只认「回环 Host + 回环 Origin + authority 为回环的 cookie」**。域名 Host/Origin 即使在
+`trustedHosts` 里也一律 `403 forbidden`（body 只有 9 字节 `forbidden`），而**同一个域名去取
+首页 HTML 却是 200** —— 这个不对称正是最坑的地方。
 
-1.0.0 只做透传：表现是**手机能打开页面，但对话发不出去、一直转圈**。
+所以代理对所有请求（不只是 `upgrade`）都把这三样统一改写成回环：
+`Host: 127.0.0.1:<DSH 端口>`、`Origin` 同步、cookie 换成回环 authority 签的那枚，
+并把上游种的 `dsh-auth-*` 响应 cookie 剥掉、只发域名这一份。来源 Host 在上一步已经校验过，
+改写不会放宽任何外部可达性。
+
+> ❗别只改 WebSocket。只改它的话，表现是**手机能打开页面、侧栏也在，但对话列表和一切数据全空**
+> （首页 HTML 200，所有 `/api` 请求 403）。1.0.0 是纯透传，症状是「对话发不出去一直转圈」；
+> 1.1.0 修了 WebSocket 但没修 HTTP，症状变成「界面空壳」；1.1.1 才把两者一起修掉。
 
 ## 前置条件
 
@@ -169,6 +176,7 @@ DSH 远程访问自检
 | 自检说「探测失败」 | Tailscale 没装或没登录。托盘图标右键 → Log in |
 | 手机 / 电脑打开 **502** | 代理连不上 DSH：桌面端没启动，或端口探测失败。可 `netstat -ano \| findstr LISTENING` 看实际端口，必要时用 `DSH_TARGET_PORT` 显式指定 |
 | 手机能打开页面、但对话一直转圈 | WebSocket 被 DSH 拒了。1.1.0 起代理会自动改写 Host/Origin；旧版请升级 |
+| 手机能打开页面、但**对话列表和所有数据空白** | `/api/*` 被 DSH 拒了（403）。1.1.1 起普通请求也做回环改写；旧版请升级 |
 | 手机打开 **403** | profile 没配 `trustedHosts`，或域名写错。改完要**重启 DSH** |
 | 手机打开 **502** | 代理活着但 DSH 桌面端没开 |
 | **证书错误** | HTTPS 没启用。跑一次不带 `--bg` 的 `tailscale serve` 走完同意流程 |

@@ -1,5 +1,16 @@
 # 更新日志
 
+## 1.1.1 — 2026-10-17
+
+### 修复
+
+- **手机能打开页面、但对话列表和所有数据全空**：1.1.0 只改写了 WebSocket 的 Host/Origin，
+  普通 HTTP 请求仍原样透传域名 —— 而 DSH 0.2.1 对 `/api/*` 同样只认回环 Host，一律
+  `403 forbidden`（同一个域名取首页 HTML 却是 200，所以症状是「界面壳在、数据全空」）。
+  现在**所有**请求（不只 `upgrade`）都把 Host/Origin 改写成回环、cookie 重签成回环 authority，
+  并剥掉上游的 `dsh-auth-*` 响应 cookie、只发域名这一份。
+- `check.mjs` 新增 `POST /api/session/list` 探针 —— 只看首页 200 会漏掉这个故障。
+
 ## 1.1.0 — 2026-10-17
 
 ### 修复

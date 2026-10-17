@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-proxy",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Expose your DSH desktop app to your phone via Tailscale, with automatic login",
   "type": "module",
