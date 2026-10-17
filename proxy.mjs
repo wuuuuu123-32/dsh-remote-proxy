@@ -1,6 +1,8 @@
 // dsh-remote-proxy —— 把你的 DSH 安全地开放给手机(经 Tailscale)
 //
-// 背景：DSH 桌面端内置的 Web 服务固定监听 127.0.0.1:19387，只有本机能开。
+// 背景：DSH 桌面端内置的 Web 服务只监听回环地址，只有本机能开。
+//       端口在 0.2.0 及更早是固定的 19387；0.2.1 起改为系统分配（每次启动可能不同），
+//       所以这里默认自动探测，DSH_TARGET_PORT 只用来显式覆盖。
 //       手机走 Tailscale 打进来的是 127.0.0.1:3080（tailscale serve 的目标端口）。
 //       这个代理站在两者中间。
 //
@@ -19,7 +21,7 @@
 // 需要覆盖时用环境变量：
 //   DSH_AUTHORITY     期望的访问域名，默认自动探测（<机器名>.<tailnet>.ts.net）
 //   DSH_REMOTE_PORT   代理监听端口，默认 3080（与 tailscale serve 的目标一致）
-//   DSH_TARGET_PORT   DSH 桌面端 Web 端口，默认 19387
+//   DSH_TARGET_PORT   DSH 桌面端 Web 端口；不设则自动探测（0.2.1 起端口由系统分配）
 //   DSH_HOME          DSH 数据目录，默认 ~/.dsh
 //   DSH_CREDENTIALS   凭据文件路径，默认 <DSH_HOME>/.credentials.yaml
 
@@ -29,6 +31,8 @@ import crypto from 'node:crypto';
 import {
   LISTEN_PORT,
   TARGET_PORT,
+  TARGET_PORT_OVERRIDE,
+  detectDshPort,
   COOKIE_DAYS,
   CREDENTIALS,
   b64u,
@@ -37,6 +41,9 @@ import {
   matchAuthority,
   normalizeHost
 } from './config.mjs';
+
+// 桌面端 0.2.1 起用系统分配的端口，每次启动都可能变 —— 用可变量持有，探测到变化就替换。
+let targetPort = TARGET_PORT;
 
 let AUTHORITY;
 let secret;
@@ -58,7 +65,7 @@ try {
  * 代理就会为这个 loopback authority 签一份 cookie 并原样转发；DSH 看到「Host 是回环 + 一份合法 cookie」
  * 就放行 —— trustedHosts 被整条绕过（2026-10-17 盲审的 P0）。
  *
- * 现在只认 AUTHORITY。本机要访问请直接开 http://127.0.0.1:19387/ ，不经过这个代理。
+ * 现在只认 AUTHORITY。本机要访问请直接开 DSH 的窗口（或 http://127.0.0.1:<DSH 端口>/），不经过这个代理。
  * 确实需要放行回环 Host 时设 DSH_ALLOW_LOOPBACK=1（仅供本机调试）。
  */
 const ALLOW_LOOPBACK = process.env.DSH_ALLOW_LOOPBACK === '1';
@@ -117,7 +124,7 @@ function handle(req, res) {
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end(
       'dsh-remote-proxy：只接受 https://' + AUTHORITY + '/ 这个域名。\n' +
-        '本机请直接访问 http://127.0.0.1:' + TARGET_PORT + '/ ，不要经过这个代理。\n'
+        '本机请直接访问 http://127.0.0.1:' + targetPort + '/ ，不要经过这个代理。\n'
     );
     return;
   }
@@ -136,7 +143,7 @@ function handle(req, res) {
   const forward = (headers, retried) => {
     const upstream = http.request({
       host: '127.0.0.1',
-      port: TARGET_PORT,
+      port: targetPort,
       path: req.url,
       method: req.method,
       headers
@@ -163,13 +170,35 @@ function handle(req, res) {
       pres.pipe(res);
     });
     upstream.on('error', (error) => {
+      // 桌面端重启会换端口：失败时立刻补探一次，下一个请求就能连上（不必等轮询）
+      if (TARGET_PORT_OVERRIDE === undefined) {
+        void detectDshPort().then((found) => {
+          if (found !== undefined && found !== targetPort) {
+            console.log('DSH 端口变化：' + targetPort + ' -> ' + found);
+            targetPort = found;
+          }
+        });
+      }
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`dsh-remote-proxy：连不上 DSH 的 127.0.0.1:${TARGET_PORT} —— ${error.message}\n`);
+      res.end(`dsh-remote-proxy：连不上 DSH 的 127.0.0.1:${targetPort} —— ${error.message}\n`);
     });
     req.pipe(upstream);
   };
 
   forward(prepareHeaders(req.headers), false);
+}
+
+// 系统分配的端口每次启动都可能变。这里每 5 分钟重探一次，换端口后下一个请求自动跟上；
+// 请求失败时还会立刻补探（见上面的 upstream.on('error')），所以实际感知延迟是「第一次 502」。
+if (TARGET_PORT_OVERRIDE === undefined) {
+  setInterval(() => {
+    void detectDshPort().then((found) => {
+      if (found !== undefined && found !== targetPort) {
+        console.log('DSH 端口变化：' + targetPort + ' -> ' + found);
+        targetPort = found;
+      }
+    });
+  }, 300000).unref();
 }
 
 const server = http.createServer(handle);
@@ -182,12 +211,16 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  const name = cookieName(authority);
+  // ❗DSH 的 WebSocket 端点只认「回环 Host + 回环 Origin + authority 为回环的 cookie」：
+  // 即便 profile 的 trustedHosts 里配了访问域名，域名 Host/Origin 也一律 403（2026-10-17 实测四种组合，
+  // 只有回环那组拿到 101）。所以这里把三者统一改写成回环；来源 Host 上面已经校验过，改写是安全的。
+  const loopAuthority = '127.0.0.1:' + targetPort;
+  const name = cookieName(loopAuthority);
   const headers = { ...req.headers };
-  if (!hasCookie(headers.cookie, name)) {
-    headers.cookie = withCookie(headers.cookie, name, mintCookie(authority));
-  }
-  const upstream = net.connect(TARGET_PORT, '127.0.0.1', () => {
+  headers.host = loopAuthority;
+  if (headers.origin !== undefined) headers.origin = 'http://' + loopAuthority;
+  headers.cookie = withCookie(headers.cookie, name, mintCookie(loopAuthority));
+  const upstream = net.connect(targetPort, '127.0.0.1', () => {
     const lines = [`${req.method} ${req.url} HTTP/1.1`];
     for (const [key, value] of Object.entries(headers)) {
       lines.push(`${key}: ${Array.isArray(value) ? value.join(', ') : value}`);
@@ -203,7 +236,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(LISTEN_PORT, '127.0.0.1', () => {
-  console.log(`dsh-remote-proxy：127.0.0.1:${LISTEN_PORT} -> 127.0.0.1:${TARGET_PORT}`);
+  console.log(`dsh-remote-proxy：127.0.0.1:${LISTEN_PORT} -> 127.0.0.1:${targetPort}（自动探测）`);
   console.log(`  接受域名：${AUTHORITY}`);
   console.log(`  凭据文件：${CREDENTIALS}`);
   console.log('  手机打开：https://' + AUTHORITY + '/（首次会自动种 30 天 cookie）');

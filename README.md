@@ -2,7 +2,7 @@
 
 > 用 Tailscale 把电脑上的 **DSH 桌面端** 安全地开放给手机 —— 免费、HTTPS、可装 PWA、**手机不用带 token**。
 
-DSH（DeepSeek Harness）桌面端内置的 Web 服务只监听 `127.0.0.1:19387`，手机够不着。
+DSH（DeepSeek Harness）桌面端内置的 Web 服务只监听回环地址（0.2.0 及更早固定 `127.0.0.1:19387`，**0.2.1 起由系统分配、每次启动可能不同**），手机够不着。
 Tailscale 能把请求从外面送进来，但还有两个拦路虎，这个小代理一次解决：
 
 1. **403：DSH 的信任栅栏** —— 它检查 Host 头，默认只放行 `127.0.0.1` 和局域网 IP，`xxx.ts.net` 会被拒。
@@ -26,10 +26,30 @@ Tailscale 能把请求从外面送进来，但还有两个拦路虎，这个小�
                           · 401 时换新 cookie 自己重取一次（浏览器侧零跳转 → 不可能循环）
                               │
                               ▼
-                        DSH 桌面端 127.0.0.1:19387
+                        DSH 桌面端 127.0.0.1:<DSH 端口>（自动探测）
 ```
 
 **关键点：DSH 完全不用改监听地址**，仍然只听回环。是 Tailscale 在本地帮它做了 HTTPS 反代。
+
+### 端口自动探测（0.2.1 起）
+
+DSH 桌面端 0.2.0 及更早固定监听 `19387`；**0.2.1 起改为系统分配**，每次启动都可能换一个。
+代理因此不再写死端口，而是：
+
+1. 启动时用 `GetExtendedTcpTable` 反查「哪个进程是 `DeepSeek Harness.exe` 且处于 LISTENING」；
+2. 之后每 5 分钟复查一次；某次请求连不上时**立刻**补探一次 —— 换端口后下一个请求自动跟上；
+3. 只有设置 `DSH_TARGET_PORT` 时才完全跳过探测。
+
+所以 DSH 升级、重启换端口，代理这边都不用改。
+
+### WebSocket 也要过一次改写
+
+对话的实时通道是 `/api/remote.mux` 的 WebSocket。实测 DSH 对它比对普通 HTTP 更严：
+**只认「回环 Host + 回环 Origin + authority 为回环的 cookie」**，域名 Host/Origin 即使在
+`trustedHosts` 里也一律 `403 forbidden`。所以代理在 `upgrade` 时把这三样统一改写成回环 ——
+来源 Host 在上一步已经校验过，改写不会放宽任何外部可达性。
+
+1.0.0 只做透传：表现是**手机能打开页面，但对话发不出去、一直转圈**。
 
 ## 前置条件
 
@@ -117,7 +137,7 @@ DSH 远程访问自检
   ✓ Tailscale 客户端    C:\Program Files\Tailscale\tailscale.exe
   ✓ 访问域名             <机器名>.<tailnet>.ts.net
   ✓ DSH 凭据文件         C:\Users\you\.dsh\.credentials.yaml
-  ✓ DSH 桌面端 :19387   在监听
+  ✓ DSH 桌面端 :63645   在监听（自动探测）
   ✓ 本代理 :3080        已在运行
   ✓ tailscale serve   已指向 3080
   ✓ profile 信任白名单   desktop 已包含该域名
@@ -138,7 +158,7 @@ DSH 远程访问自检
 |---|---|---|
 | `DSH_AUTHORITY` | 自动探测 | 访问域名。探测方式：`tailscale status --json` 的 `Self.DNSName` |
 | `DSH_REMOTE_PORT` | `3080` | 代理监听端口（要和 `tailscale serve` 的目标一致） |
-| `DSH_TARGET_PORT` | `19387` | DSH 桌面端 Web 端口 |
+| `DSH_TARGET_PORT` | 自动探测 | DSH 桌面端 Web 端口。**不设则自动探测**（0.2.1 起由系统分配）；显式设置则完全接管、不再探测 |
 | `DSH_HOME` | `~/.dsh` | DSH 数据目录 |
 | `DSH_CREDENTIALS` | `<DSH_HOME>/.credentials.yaml` | 凭据文件路径 |
 
@@ -147,6 +167,8 @@ DSH 远程访问自检
 | 症状 | 原因 / 解决 |
 |---|---|
 | 自检说「探测失败」 | Tailscale 没装或没登录。托盘图标右键 → Log in |
+| 手机 / 电脑打开 **502** | 代理连不上 DSH：桌面端没启动，或端口探测失败。可 `netstat -ano \| findstr LISTENING` 看实际端口，必要时用 `DSH_TARGET_PORT` 显式指定 |
+| 手机能打开页面、但对话一直转圈 | WebSocket 被 DSH 拒了。1.1.0 起代理会自动改写 Host/Origin；旧版请升级 |
 | 手机打开 **403** | profile 没配 `trustedHosts`，或域名写错。改完要**重启 DSH** |
 | 手机打开 **502** | 代理活着但 DSH 桌面端没开 |
 | **证书错误** | HTTPS 没启用。跑一次不带 `--bg` 的 `tailscale serve` 走完同意流程 |

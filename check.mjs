@@ -3,7 +3,7 @@
 // 用法：node check.mjs
 //
 // 判读（从下往上依次是链路的每一段）：
-//   桌面端 19387 在监听         -> 链路最里面那一段通了
+//   桌面端端口在监听            -> 链路最里面那一段通了（端口自动探测）
 //   域名 / 无 cookie            -> HTTP 200 且下发 cookie = 代理自动登录正常（期望状态）
 //   域名 / 带伪造旧 cookie      -> HTTP 200                    = 残留旧 cookie 会被代理换掉
 //   本机 3080 / 无 cookie       -> HTTP 200                    = 代理本身活着
@@ -18,7 +18,7 @@ import https from 'node:https';
 import http from 'node:http';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
-import { LISTEN_PORT, TARGET_PORT, b64u, detectAuthority, loadSecret, probeTcp } from './config.mjs';
+import { LISTEN_PORT, TARGET_PORT, TARGET_PORT_OVERRIDE, b64u, detectAuthority, loadSecret, probeTcp } from './config.mjs';
 
 let AUTHORITY;
 try {
@@ -83,7 +83,7 @@ function wsProbe() {
 
 const desktop = await probeTcp(TARGET_PORT);
 console.log('目标：https://' + AUTHORITY + '/');
-console.log(`  DSH 桌面端 127.0.0.1:${TARGET_PORT}   -> ${desktop.ok ? '在监听' : '不通（' + desktop.detail + '）'}`);
+console.log(`  DSH 桌面端 127.0.0.1:${TARGET_PORT}${TARGET_PORT_OVERRIDE === undefined ? '（自动探测）' : '（DSH_TARGET_PORT）'}  -> ${desktop.ok ? '在监听' : '不通（' + desktop.detail + '）'}`);
 console.log('  无 cookie（模拟新手机）       ->', await getHttps(undefined));
 console.log('  带伪造的同名旧 cookie         ->', await getHttps(NAME + '=v1.bogus.bogus'));
 console.log(`  本机 127.0.0.1:${LISTEN_PORT} 无 cookie ->`, await getLocal(undefined));

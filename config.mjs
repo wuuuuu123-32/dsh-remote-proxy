@@ -10,7 +10,13 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 export const LISTEN_PORT = Number(process.env.DSH_REMOTE_PORT ?? 3080);
-export const TARGET_PORT = Number(process.env.DSH_TARGET_PORT ?? 19387);
+// 进程名匹配（探测时用）；定义在 TARGET_PORT 之前，避免模块顶层求值撞上 TDZ。
+const DSH_PROCESS_RE = /deepseek[\s._-]*harness/iu;
+
+export const TARGET_PORT_OVERRIDE = process.env.DSH_TARGET_PORT ? Number(process.env.DSH_TARGET_PORT) : undefined;
+// 0.2.1 起桌面端改用系统分配的端口（官方发布说明），写死 19387 会让代理整个失效。
+// 优先级：DSH_TARGET_PORT 环境变量 > 自动探测 > 19387（旧值，仅作最后兜底）。
+export const TARGET_PORT = TARGET_PORT_OVERRIDE ?? (await detectDshPort()) ?? 19387;
 export const COOKIE_DAYS = 30; // 与 DSH 自己的 cookie 上限一致，签更长会被服务端拒收
 export const DSH_HOME = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
 export const CREDENTIALS = process.env.DSH_CREDENTIALS ?? path.join(DSH_HOME, '.credentials.yaml');
@@ -145,4 +151,112 @@ export function probeTcp(port, host = '127.0.0.1', timeout = 2000) {
     socket.on('timeout', () => done(false, '超时'));
     socket.on('error', (error) => done(false, error.code ?? error.message));
   });
+}
+
+// ---------------- 桌面端端口自动探测 ----------------
+//
+// 为什么需要：0.2.1-rc.2 起「桌面端默认使用系统分配的端口」（官方发布说明），
+// 不再是固定 19387 —— 2026-10-17 实测 19387 已无监听、实际是 63645。
+// 写死端口的代理会 100% 失效（手机端 502），所以这里改成每次启动探测、运行中定期重探。
+//
+// 做法：netstat/tasklist 都是系统自带命令，零依赖。本机同时存在 10 个
+// "DeepSeek Harness.exe" 进程，但**只有一个在监听回环端口**，所以交集基本唯一。
+
+function runQuiet(file, args, timeout = 10000) {
+  try {
+    return execFileSync(file, args, { encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Windows：netstat -ano 里 127.0.0.1/[::1] 的 LISTENING 行 → [{port,pid}] */
+function windowsListeners() {
+  const out = runQuiet('netstat', ['-ano']);
+  if (typeof out !== 'string') return [];
+  const rows = [];
+  for (const line of out.split(/\r?\n/u)) {
+    const m = line.match(/^\s*TCP\s+(?:127\.0\.0\.1|\[::1\]):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/iu);
+    if (m !== null) rows.push({ port: Number(m[1]), pid: Number(m[2]) });
+  }
+  return rows;
+}
+
+/** Windows：tasklist 里进程名匹配 DSH 的 PID 集合 */
+function windowsDshPids() {
+  const out = runQuiet('tasklist', ['/FO', 'CSV', '/NH']);
+  const pids = new Set();
+  if (typeof out !== 'string') return pids;
+  for (const line of out.split(/\r?\n/u)) {
+    // "DeepSeek Harness.exe","28652","Console","1","671,344 K"
+    const cols = line.match(/^"([^"]*)","([^"]*)"/u);
+    if (cols !== null && DSH_PROCESS_RE.test(cols[1])) pids.add(Number(cols[2]));
+  }
+  return pids;
+}
+
+/** Unix：lsof 的 LISTEN 行 → [{port,pid}] */
+function unixListeners() {
+  const out = runQuiet('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN']);
+  if (typeof out !== 'string') return [];
+  const rows = [];
+  for (const line of out.split(/\r?\n/u)) {
+    const m = line.match(/^\S+\s+(\d+)\s+.*TCP\s+(?:127\.0\.0\.1|\[::1\]):(\d+)\s+\(LISTEN\)/u);
+    if (m !== null) rows.push({ port: Number(m[2]), pid: Number(m[1]) });
+  }
+  return rows;
+}
+
+function unixDshPids() {
+  const out = runQuiet('ps', ['-Ao', 'pid=,comm=']);
+  const pids = new Set();
+  if (typeof out !== 'string') return pids;
+  for (const line of out.split(/\r?\n/u)) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/u);
+    if (m !== null && DSH_PROCESS_RE.test(m[2])) pids.add(Number(m[1]));
+  }
+  return pids;
+}
+
+/**
+ * 探测 DSH 桌面端的 Web 端口；探不到返回 undefined。
+ * 环境变量 DSH_TARGET_PORT 显式指定时不再探测（见 TARGET_PORT_OVERRIDE）。
+ */
+/**
+ * 这个端口是不是 DSH 的 Web 服务？
+ * ❗只按「进程名 + 在监听」筛是不够的：DSH 主进程里跑的插件也会监听回环端口
+ * （实测同时命中 9877 —— Blender 实时通道，和 63645 —— 真正的 Web 端口）。
+ * 所以再发一个 HTTP 请求确认：DSH 的首页一定带 __DSH_BOOT__，未登录时是 3xx/401。
+ */
+async function looksLikeDsh(port) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1200);
+  try {
+    const res = await fetch('http://127.0.0.1:' + port + '/', { signal: controller.signal, redirect: 'manual' });
+    const type = res.headers.get('content-type') ?? '';
+    const body = type.includes('text/html') ? await res.text() : '';
+    if (/__DSH_BOOT__|DeepSeek Harness/iu.test(body)) return true;
+    return res.status === 401 || res.status === 302 || res.status === 303;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 探测 DSH 桌面端的 Web 端口；探不到返回 undefined。
+ * 环境变量 DSH_TARGET_PORT 显式指定时不再探测（见 TARGET_PORT_OVERRIDE）。
+ */
+export async function detectDshPort() {
+  const listeners = process.platform === 'win32' ? windowsListeners() : unixListeners();
+  if (listeners.length === 0) return undefined;
+  const dshPids = process.platform === 'win32' ? windowsDshPids() : unixDshPids();
+  const ports = [...new Set(listeners.filter((r) => dshPids.has(r.pid)).map((r) => r.port))]
+    .filter((port) => port !== LISTEN_PORT)   // 别把自己（3080）当成目标
+    .sort((a, b) => a - b);
+  for (const port of ports) {
+    if (await looksLikeDsh(port)) return port;
+  }
+  return undefined;
 }

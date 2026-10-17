@@ -3,7 +3,7 @@ REM ============================================================
 REM  dsh-remote-proxy launcher (Windows)
 REM
 REM  Bridges Tailscale (127.0.0.1:3080) to the DSH desktop app
-REM  (127.0.0.1:19387) and auto-injects the login cookie, so the
+REM  (port auto-detected; DSH 0.2.1+ allocates it dynamically) and
 REM  phone needs no token.
 REM
 REM  Requires: DSH desktop app running, Tailscale logged in,
