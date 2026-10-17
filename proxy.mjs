@@ -33,7 +33,9 @@ import {
   CREDENTIALS,
   b64u,
   detectAuthority,
-  loadSecret
+  loadSecret,
+  matchAuthority,
+  normalizeHost
 } from './config.mjs';
 
 let AUTHORITY;
@@ -61,21 +63,14 @@ try {
  */
 const ALLOW_LOOPBACK = process.env.DSH_ALLOW_LOOPBACK === '1';
 
-/** 比较用：去掉默认端口，避免 https 默认 443 有无端口的写法被当成两个域名 */
-const stripDefaultPort = (host) => host.replace(/:(?:443|80)$/u, '');
-
-function authorityOf(headers) {
-  const host = headers.host;
-  if (typeof host !== 'string' || host === '') return undefined;
-  let canonical;
-  try { canonical = new URL('http://' + host).host; } catch { return undefined; }
-  if (canonical !== '' && stripDefaultPort(canonical) === stripDefaultPort(AUTHORITY)) return canonical;
-  if (ALLOW_LOOPBACK && /^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\])(?::\d+)?$/iu.test(canonical)) return canonical;
-  return undefined;
-}
+/**
+ * 判定逻辑（含域名大小写归一、回环放行条件）已移到 config.mjs 的 matchAuthority，
+ * 那边是纯函数，可以直接单测；这里只绑定本进程的 AUTHORITY 与开关。
+ */
+const authorityOf = (headers, remoteAddress) => matchAuthority(headers, remoteAddress, AUTHORITY, ALLOW_LOOPBACK);
 
 function cookieName(authority) {
-  return 'dsh-auth-' + b64u(crypto.createHash('sha256').update(authority).digest());
+  return 'dsh-auth-' + b64u(crypto.createHash('sha256').update(normalizeHost(authority)).digest());
 }
 
 /** 按 DSH 的格式签一个绑定该 authority 的 cookie。 */
@@ -96,6 +91,8 @@ function cookieHeader(authority) {
   const expires = new Date(Date.now() + maxAge * 1000).toUTCString();
   // HttpOnly：这枚 cookie 只该由浏览器自动携带，JS 读不到，XSS 也偷不走；
   // Secure：唯一入口是 https（tailscale serve），加锁后不会再随明文 http 发出去。
+  // 注意：如果直接拿明文 http 访问 3080，浏览器会丢弃这条 Secure cookie，表现是每次请求都重签一枚，
+  // 功能不受影响（响应头每次都带 Set-Cookie），只是多一次 HMAC，不必为此去掉 Secure。
   return `${cookieName(authority)}=${mintCookie(authority)}; Max-Age=${maxAge}; Path=/; Expires=${expires}; SameSite=Lax; HttpOnly; Secure`;
 }
 
@@ -114,7 +111,7 @@ const hasCookie = (headerValue, name) =>
 const asArray = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
 function handle(req, res) {
-  const authority = authorityOf(req.headers);
+  const authority = authorityOf(req.headers, req.socket && req.socket.remoteAddress);
   if (authority === undefined) {
     // ❗不要「不签 cookie 但还是转发」：那样远端伪造 Host 依然能被 DSH 当成回环请求放行。
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
@@ -179,7 +176,7 @@ const server = http.createServer(handle);
 
 // WebSocket 升级：同样补 cookie，然后原样透传握手与后续字节流。
 server.on('upgrade', (req, socket, head) => {
-  const authority = authorityOf(req.headers);
+  const authority = authorityOf(req.headers, socket.remoteAddress);
   if (authority === undefined) {
     socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
     socket.destroy();

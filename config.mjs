@@ -95,6 +95,46 @@ export function loadSecret() {
   return secret;
 }
 
+// ---------------- Host / authority 判定（纯函数，便于单测） ----------------
+
+/** 去掉默认端口，避免 https 默认 443 有无端口的写法被当成两个域名 */
+export const stripDefaultPort = (host) => host.replace(/:(?:443|80)$/u, '');
+
+/**
+ * 域名大小写不敏感：DSH_AUTHORITY 写成 DSH.TS.NET 与 dsh.ts.net 必须被视为同一站点。
+ * ❗曾经直接拿 URL 规范化后的 host 与配置原文做 === 比较，配置写大写时永远不相等 → 全部 403
+ * （2026-10-17 独立评审指出）。浏览器发来的 Host 一律小写，所以统一归一到小写再比较与签 cookie。
+ */
+export const normalizeHost = (host) => stripDefaultPort(host).toLowerCase();
+
+const LOOPBACK_HOST_RE = /^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\])(?::\d+)?$/iu;
+
+/** 请求是不是真的从本机回环发来的（不是"Host 头写着回环"） */
+export const fromLoopback = (ip) =>
+  typeof ip === 'string' && /^(?:127\.|::1$|::ffff:127\.)/u.test(ip);
+
+/**
+ * 返回规范化后的 authority；不是允许的站点就返回 undefined。
+ * 调用方拿到 undefined 必须直接 403，不能「不签 cookie 但还是转发」。
+ *
+ * @param headers          请求头（只看 host）
+ * @param remoteAddress    socket 的 remoteAddress，用于判断是否真的来自本机
+ * @param expected         配置里期望的域名（原文，大小写无所谓）
+ * @param allowLoopback    是否放行回环 Host（必须同时是回环来源，见下）
+ */
+export function matchAuthority(headers, remoteAddress, expected, allowLoopback = false) {
+  const host = headers.host;
+  if (typeof host !== 'string' || host === '') return undefined;
+  let canonical;
+  try { canonical = new URL('http://' + host).host; } catch { return undefined; }
+  if (canonical === '') return undefined;
+  if (normalizeHost(canonical) === normalizeHost(expected)) return normalizeHost(canonical);
+  // ❗调试放行必须同时满足：显式开启 + 物理上来自回环。
+  // 只看 Host 的话，远端只要把 Host 改成 127.0.0.1 就能重新打开原来那个绕过面（2026-10-17 评审指出）。
+  if (allowLoopback && fromLoopback(remoteAddress) && LOOPBACK_HOST_RE.test(canonical)) return normalizeHost(canonical);
+  return undefined;
+}
+
 /** 探测某个本地端口有没有在监听（用来确认 DSH 桌面端开着）。 */
 export function probeTcp(port, host = '127.0.0.1', timeout = 2000) {
   return new Promise((resolve) => {
