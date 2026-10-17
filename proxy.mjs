@@ -76,6 +76,23 @@ const ALLOW_LOOPBACK = process.env.DSH_ALLOW_LOOPBACK === '1';
  */
 const authorityOf = (headers, remoteAddress) => matchAuthority(headers, remoteAddress, AUTHORITY, ALLOW_LOOPBACK);
 
+/**
+ * ❗跨源请求必须在改写之前拦掉（2026-10-17 复审指出的 CSRF 面）。
+ *
+ * 代理会把 Host/Origin 改写成回环，而 DSH 对回环请求一律放行 —— 于是「任何能让浏览器访问
+ * https://<域名>/ 的页面」都能驱动浏览器发出带认证的写请求（cookie 由代理自己签，浏览器不需要持有）。
+ * 所以：只要带了 Origin，就必须等于访问域名本身；其余一律 403。
+ * 没有 Origin 的请求（同源 GET、curl、健康检查）不受影响。
+ */
+function originAllowed(origin) {
+  if (origin === undefined) return true;
+  try {
+    return normalizeHost(new URL(String(origin)).host) === normalizeHost(AUTHORITY);
+  } catch {
+    return false;
+  }
+}
+
 function cookieName(authority) {
   return 'dsh-auth-' + b64u(crypto.createHash('sha256').update(normalizeHost(authority)).digest());
 }
@@ -104,15 +121,15 @@ function cookieHeader(authority) {
 }
 
 /**
- * 用我们签的 cookie 覆盖掉所有 dsh-auth-* 条目。
+ * 用我们签的 cookie 覆盖同名项。
  *
- * ❗过滤的是**整个前缀**而不是同名项：DSH 按「请求 Host」算 cookie 名，
- * 浏览器手里那枚是域名 authority 签的、名字不同，留着会被 DSH 当成另一个会话的凭据，
- * 而且它排在前面时我们追加的同名项可能取不到。统一只留一枚回环 authority 的。
+ * ❗只替换**同名那一枚**（回环 authority 的）。曾一度改成「过滤整个 dsh-auth- 前缀」，
+ * 想一次清干净，但那样会把 DSH 自己种的其他 dsh-auth-* 也吞掉（登出/多设备语义靠它），
+ * 2026-10-17 复审指出后收窄回来。浏览器手里域名那枚名字不同，DSH 按 Host 找回环名，留着不影响。
  */
 function withCookie(headerValue, name, value) {
   const kept = typeof headerValue === 'string'
-    ? headerValue.split(';').map((s) => s.trim()).filter((s) => s !== '' && !s.startsWith('dsh-auth-'))
+    ? headerValue.split(';').map((s) => s.trim()).filter((s) => s !== '' && !s.startsWith(name + '='))
     : [];
   kept.push(name + '=' + value);
   return kept.join('; ');
@@ -134,6 +151,16 @@ function handle(req, res) {
     );
     return;
   }
+  // ❗跨源请求必须在改写之前拦掉（2026-10-17 复审指出的 CSRF 面）：代理会把 Host/Origin 改成回环，
+  // 而 DSH 对回环请求一律放行 —— 于是任何能让浏览器访问 https://<域名>/ 的页面，都能驱动浏览器
+  // 发出带认证的写请求（cookie 由代理自己签，浏览器根本不需要持有）。所以只要带了 Origin，
+  // 就必须等于访问域名本身；没有 Origin 的请求（同源 GET、curl、健康检查）不受影响。
+  if (!originAllowed(req.headers.origin)) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end('dsh-remote-proxy：跨源请求被拒绝（Origin 必须等于访问域名）。\n');
+    return;
+  }
+
   // ❗0.2.1 起 DSH 的 /api 与 WebSocket 一样只认「回环 Host + 回环 Origin + authority 为回环的 cookie」：
   // 域名 Host 的 HTTP 请求会被 403（页面 HTML 本身却放行），表现是「界面壳能打开、对话和数据全空」。
   // 所以普通请求也必须把三者改写成回环；来源 Host 上面已经校验过，改写是安全的。
@@ -166,8 +193,8 @@ function handle(req, res) {
         return;
       }
       const out = { ...pres.headers };
-      // 上游种的 cookie 绑的是回环 authority，浏览器带回来也用不上 —— 剥掉，只发域名这一份。
-      const existing = asArray(out['set-cookie']).filter((line) => !line.startsWith('dsh-auth-'));
+      // 只剥「回环 authority 那一枚」：DSH 自己发的其他 cookie（含登出用的过期 cookie）必须留着。
+      const existing = asArray(out['set-cookie']).filter((line) => !line.startsWith(name + '='));
       out['set-cookie'] = [...existing, cookieHeader(authority)];
       // 页面 HTML 一律不缓存：DSH 自己不发 cache-control，浏览器留着旧版本前端壳时，
       // 换版本后会拿旧资源名去请求（404）→ 界面残缺（例如没有输入框）。带 hash 的静态资源不用管。
@@ -215,6 +242,11 @@ const server = http.createServer(handle);
 server.on('upgrade', (req, socket, head) => {
   const authority = authorityOf(req.headers, socket.remoteAddress);
   if (authority === undefined) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  if (!originAllowed(req.headers.origin)) {
     socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
     socket.destroy();
     return;

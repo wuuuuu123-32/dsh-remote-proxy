@@ -84,6 +84,19 @@ function apiProbe(path) {
   });
 }
 
+/** 跨源请求必须被拒：代理会把 Origin 改写成回环，放过去等于替攻击者补上身份。 */
+function crossOriginProbe(origin) {
+  return new Promise((resolve) => {
+    const req = https.request(
+      { host: AUTHORITY, port: 443, path: '/api/session/list', method: 'POST', headers: { Host: AUTHORITY, Origin: origin, 'content-type': 'application/json' }, servername: AUTHORITY },
+      (res) => { let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => resolve(`HTTP ${res.statusCode}`)); }
+    );
+    req.on('error', (e) => resolve('失败 ' + (e.code ?? e.message)));
+    req.setTimeout(15000, () => { req.destroy(); resolve('超时'); });
+    req.end('{}');
+  });
+}
+
 function wsProbe() {
   return new Promise((resolve) => {
     const sock = tls.connect({ host: AUTHORITY, port: 443, servername: AUTHORITY }, () => {
@@ -110,3 +123,4 @@ console.log('  带伪造的同名旧 cookie         ->', await getHttps(NAME + '
 console.log(`  本机 127.0.0.1:${LISTEN_PORT} 无 cookie ->`, await getLocal(undefined));
 console.log('  WSS /api/remote.mux           ->', await wsProbe());
 console.log('  POST /api/session/list        ->', await apiProbe('/api/session/list'), '  ← 403 就是「对话和数据全空」');
+console.log('  跨源 Origin（应为 403）       ->', await crossOriginProbe('https://evil.example.com'), '  ← 200/502 都是漏洞');
