@@ -49,17 +49,29 @@ try {
 }
 
 /**
- * cookie 的 authority 必须与请求的 Host 完全一致（DSH 用 Host 算 cookie 名并写进签名负载），
- * 所以按每个请求的真实 Host 现算，而不是写死域名。
+ * 只接受配置里的访问域名，其余一律拒绝。
+ *
+ * ❗旧实现额外放行了 loopback Host（127.0.0.1 / localhost / [::1]），本意是「本机从 3080 也能打开」。
+ * 但 Host 是请求方自己填的：从 Tailscale 打进来的远端请求只要把 Host 改成 127.0.0.1:3080，
+ * 代理就会为这个 loopback authority 签一份 cookie 并原样转发；DSH 看到「Host 是回环 + 一份合法 cookie」
+ * 就放行 —— trustedHosts 被整条绕过（2026-10-17 盲审的 P0）。
+ *
+ * 现在只认 AUTHORITY。本机要访问请直接开 http://127.0.0.1:19387/ ，不经过这个代理。
+ * 确实需要放行回环 Host 时设 DSH_ALLOW_LOOPBACK=1（仅供本机调试）。
  */
+const ALLOW_LOOPBACK = process.env.DSH_ALLOW_LOOPBACK === '1';
+
+/** 比较用：去掉默认端口，避免 https 默认 443 有无端口的写法被当成两个域名 */
+const stripDefaultPort = (host) => host.replace(/:(?:443|80)$/u, '');
+
 function authorityOf(headers) {
   const host = headers.host;
   if (typeof host !== 'string' || host === '') return undefined;
   let canonical;
   try { canonical = new URL('http://' + host).host; } catch { return undefined; }
-  const loopback = /^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\])(?::\d+)?$/iu.test(canonical);
-  if (loopback || canonical === AUTHORITY) return canonical;
-  return undefined; // 其它 Host：不签 cookie，交给 DSH 自己的信任栅栏去拒绝
+  if (canonical !== '' && stripDefaultPort(canonical) === stripDefaultPort(AUTHORITY)) return canonical;
+  if (ALLOW_LOOPBACK && /^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\])(?::\d+)?$/iu.test(canonical)) return canonical;
+  return undefined;
 }
 
 function cookieName(authority) {
@@ -82,7 +94,9 @@ function mintCookie(authority) {
 function cookieHeader(authority) {
   const maxAge = COOKIE_DAYS * 86400;
   const expires = new Date(Date.now() + maxAge * 1000).toUTCString();
-  return `${cookieName(authority)}=${mintCookie(authority)}; Max-Age=${maxAge}; Path=/; Expires=${expires}; SameSite=Lax`;
+  // HttpOnly：这枚 cookie 只该由浏览器自动携带，JS 读不到，XSS 也偷不走；
+  // Secure：唯一入口是 https（tailscale serve），加锁后不会再随明文 http 发出去。
+  return `${cookieName(authority)}=${mintCookie(authority)}; Max-Age=${maxAge}; Path=/; Expires=${expires}; SameSite=Lax; HttpOnly; Secure`;
 }
 
 /** 把 Cookie 头里同名的那条替换成我们签的（避免浏览器残留的旧 cookie 排在前面被 DSH 先取到）。 */
@@ -101,7 +115,16 @@ const asArray = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
 function handle(req, res) {
   const authority = authorityOf(req.headers);
-  const name = authority === undefined ? undefined : cookieName(authority);
+  if (authority === undefined) {
+    // ❗不要「不签 cookie 但还是转发」：那样远端伪造 Host 依然能被 DSH 当成回环请求放行。
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(
+      'dsh-remote-proxy：只接受 https://' + AUTHORITY + '/ 这个域名。\n' +
+        '本机请直接访问 http://127.0.0.1:' + TARGET_PORT + '/ ，不要经过这个代理。\n'
+    );
+    return;
+  }
+  const name = cookieName(authority);
 
   // 客户端已带着我们的 cookie：原样转发。
   // 没带（新设备、清了数据、cookie 过期）：由代理补一个再转发 —— 浏览器侧零跳转，不可能循环。
@@ -157,9 +180,14 @@ const server = http.createServer(handle);
 // WebSocket 升级：同样补 cookie，然后原样透传握手与后续字节流。
 server.on('upgrade', (req, socket, head) => {
   const authority = authorityOf(req.headers);
-  const name = authority === undefined ? undefined : cookieName(authority);
+  if (authority === undefined) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  const name = cookieName(authority);
   const headers = { ...req.headers };
-  if (name !== undefined && !hasCookie(headers.cookie, name)) {
+  if (!hasCookie(headers.cookie, name)) {
     headers.cookie = withCookie(headers.cookie, name, mintCookie(authority));
   }
   const upstream = net.connect(TARGET_PORT, '127.0.0.1', () => {
