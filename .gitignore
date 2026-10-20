@@ -1,5 +1,7 @@
 node_modules/
 *.log
+.proxy.log*
 proxy.log
+.startup.err
 .DS_Store
 Thumbs.db

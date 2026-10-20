@@ -45,16 +45,40 @@ import {
 // 桌面端 0.2.1 起用系统分配的端口，每次启动都可能变 —— 用可变量持有，探测到变化就替换。
 let targetPort = TARGET_PORT;
 
+// ❗开机自启时 Tailscale 可能还没就绪：登录触发的计划任务往往比 tailscaled 早几十秒，
+//    那一刻 `tailscale status --json` 里还没有 Self.DNSName —— 这是**临时状态**，不是配置错误。
+//    2026-10-20 凌晨真实踩到：计划任务 01:24:32 启动，代理 01:24:34 直接 exit(1)；
+//    而计划任务是 onlogon 一次性触发、不会重试 → 手机端一路 502，直到有人手动拉起。
+//    所以这里改成「等依赖就绪」：默认最多等 3 分钟，每 5 秒重试一次。
+//    显式设 DSH_BOOT_WAIT_MS=0 可以关掉等待（排查配置错误时想立刻看到报错就用它）。
+const BOOT_WAIT_MS = Number(process.env.DSH_BOOT_WAIT_MS ?? 180000);
+const BOOT_RETRY_MS = 5000;
+
 let AUTHORITY;
 let secret;
-try {
-  AUTHORITY = detectAuthority();
-  secret = loadSecret();
-} catch (error) {
-  console.error('\ndsh-remote-proxy 启动失败：\n');
-  console.error(error.message);
-  console.error('\n先跑一次自检：node setup.mjs\n');
-  process.exit(1);
+{
+  const deadline = Date.now() + BOOT_WAIT_MS;
+  let announced = false;
+  for (;;) {
+    try {
+      AUTHORITY = detectAuthority();
+      secret = loadSecret();
+      break;
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        console.error('\ndsh-remote-proxy 启动失败：\n');
+        console.error(error.message);
+        console.error('\n先跑一次自检：node setup.mjs\n');
+        process.exit(1);
+      }
+      if (!announced) {
+        console.error(`\n等待依赖就绪（最多 ${Math.round(BOOT_WAIT_MS / 1000)} 秒，每 ${BOOT_RETRY_MS / 1000} 秒重试）：`);
+        console.error(`  ${error.message.split('\n')[0]}`);
+        announced = true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, BOOT_RETRY_MS));
+    }
+  }
 }
 
 /**

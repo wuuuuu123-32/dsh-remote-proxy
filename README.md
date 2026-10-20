@@ -90,26 +90,17 @@ https://<机器名>.<tailnet>.ts.net
 
 > Windows 上这一步通常需要**管理员权限**的终端。
 
-### 3. 让 DSH 接受这个域名
+### 3. 让 DSH 接受这个域名 —— 1.1.1 起已不需要
 
-编辑 DSH profile 的 `cordis.patch.yml`（通常在 `~/.dsh/profiles/<profile>/cordis.patch.yml`），
-在 `web-runtime` 条目里加 `trustedHosts`：
+代理会把转发给 DSH 的 `Host` 头改写成 `127.0.0.1:<端口>`，DSH 看到的是回环访问，
+因此**不用再动 `cordis.patch.yml`**。`node setup.mjs` 里那一项现在只是信息项，永远 ✓
+（显示「不需要（代理已把 Host 改写为回环）」）。
 
-```yaml
-- id: web-runtime
-  name: "@deepseek-ai/dsh-web-app"
-  config:
-    openBrowser: false
-    printUrl: true
-    surfaceContext: true
-    trustedHosts:
-      - <机器名>.<tailnet>.ts.net
-```
-
-> ⚠️ profile patch 是**整段替换** config，所以要连同已有的键一起保留，不能只写 `trustedHosts`。
-> ⚠️ 改这个文件前先备份 —— 写坏了 DSH 会起不来。
-
-**然后重启 DSH 桌面端。**
+> **历史说明**：1.0.x 是纯透传，DSH 的信任栅栏按 `Host: xxx.ts.net` 判 403，当时必须在 `web-runtime`
+> 里加 `trustedHosts`。而 profile patch 是**整段替换** config，写漏一个键 DSH 就起不来；
+> 0.2.1 起 webRuntime 的 config 结构又变了，照旧写法反而会让它起不来 —— 这条路现在整个不需要了。
+>
+> **唯一例外**：想绕过代理、直接用 `https://<域名>/` 访问 DSH 时才需要配 `trustedHosts`。
 
 ### 4. 启动代理
 
@@ -118,7 +109,7 @@ node setup.mjs      # 先自检，看还差哪一步
 node proxy.mjs      # 启动代理
 ```
 
-Windows 上双击 `start-proxy.cmd` 也行（要保持窗口开着）。
+Windows 上双击 `start-proxy.cmd` 也行（要保持窗口开着）；要开机自启见下面「开机自启」一节。
 
 ### 5. 手机打开
 
@@ -150,7 +141,7 @@ DSH 远程访问自检
   ✓ DSH 桌面端 :63645   在监听（自动探测）
   ✓ 本代理 :3080        已在运行
   ✓ tailscale serve   已指向 3080
-  ✓ profile 信任白名单   desktop 已包含该域名
+  ✓ profile 信任白名单    不需要（代理已把 Host 改写为回环）
   ✓ Tailscale 控制平面   已连接，IP 已钉死（192.200.0.109）
 ─────────────────────────────────────────────
 
@@ -159,6 +150,44 @@ DSH 远程访问自检
 
 `check.mjs` 会实测四条：新手机（无 cookie）、残留旧 cookie、本机直连、对话的实时通道（WSS）。
 期望看到 `HTTP 200` + `set-cookie=有`，以及 `101 Switching Protocols`。
+
+## 开机自启（Windows）
+
+想让它常驻，别把 `proxy.mjs` 塞进启动文件夹 —— 用**计划任务**，因为这样可以带日志：
+
+| 文件 | 作用 |
+|---|---|
+| `start-proxy-task.cmd` | 把上一份 `.proxy.log` 挪成 `.proxy.log.prev`，再用 node 跑 `proxy.mjs`，stdout/stderr 全部落进 `.proxy.log` |
+| `start-proxy-task.vbs` | 用 `WScript.Shell.Run(..., 0, False)` 起上面那个 cmd —— **0 = 无窗口**，cmd 的隐藏全靠它 |
+
+建任务（PowerShell，普通用户权限即可）：
+
+```powershell
+$dir = 'D:\dsh\config\dsh-tailscale-remote'   # 改成你自己的目录
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$dir\start-proxy-task.vbs`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger.Delay = 'PT30S'                      # 等桌面和 Tailscale 起来
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName 'DSH-RemoteProxy' -Action $action -Trigger $trigger `
+  -Settings $settings -Description 'DSH 远程代理（3080 → DSH 桌面端）'
+```
+
+手动拉起 / 看状态：
+
+```powershell
+Start-ScheduledTask -TaskName DSH-RemoteProxy
+Get-Content 'D:\dsh\config\dsh-tailscale-remote\.proxy.log' -Tail 20
+```
+
+两个坑，都是实测踩出来的：
+
+- **动作必须写 `wscript.exe`，不要直接写 `cmd.exe /c start-proxy-task.cmd`**。后者会让 cmd
+  收到杂散的 Ctrl+C：进程起来几秒就被杀，`LastTaskResult = 3221225786`（`0xC000013A` = STATUS_CONTROL_C_EXIT），
+  日志末尾留一行 `^C`。
+- **开机时 Tailscale 可能还没就绪**。登录触发的任务往往比 `tailscaled` 早几十秒，那一刻
+  `tailscale status --json` 里没有 `Self.DNSName`。1.1.3 起代理自己会等（最多 180 秒、每 5 秒重试），
+  日志里显示「等待依赖就绪」；旧版会直接退出，而计划任务不会重试 → 一路 502。
 
 ## 环境变量
 
@@ -169,6 +198,7 @@ DSH 远程访问自检
 | `DSH_AUTHORITY` | 自动探测 | 访问域名。探测方式：`tailscale status --json` 的 `Self.DNSName` |
 | `DSH_REMOTE_PORT` | `3080` | 代理监听端口（要和 `tailscale serve` 的目标一致） |
 | `DSH_TARGET_PORT` | 自动探测 | DSH 桌面端 Web 端口。**不设则自动探测**（0.2.1 起由系统分配）；显式设置则完全接管、不再探测 |
+| `DSH_BOOT_WAIT_MS` | `180000` | 启动时等依赖（Tailscale 登录 / DSH 凭据）就绪的最长毫秒数。`0` = 不等待，立刻报错 |
 | `DSH_HOME` | `~/.dsh` | DSH 数据目录 |
 | `DSH_CREDENTIALS` | `<DSH_HOME>/.credentials.yaml` | 凭据文件路径 |
 
@@ -178,9 +208,10 @@ DSH 远程访问自检
 |---|---|
 | 自检说「探测失败」 | Tailscale 没装或没登录。托盘图标右键 → Log in |
 | 手机 / 电脑打开 **502** | 代理连不上 DSH：桌面端没启动，或端口探测失败。可 `netstat -ano \| findstr LISTENING` 看实际端口，必要时用 `DSH_TARGET_PORT` 显式指定 |
+| **开机后手机一路 502**，`.proxy.log` 里说「没有 Self.DNSName」 | 代理比 Tailscale 早启动，1.1.3 起会自动等；旧版请升级，或 `Start-ScheduledTask -TaskName DSH-RemoteProxy` 手动拉起 |
 | 手机能打开页面、但对话一直转圈 | WebSocket 被 DSH 拒了。1.1.0 起代理会自动改写 Host/Origin；旧版请升级 |
 | 手机能打开页面、但**对话列表和所有数据空白** | `/api/*` 被 DSH 拒了（403）。1.1.1 起普通请求也做回环改写；旧版请升级 |
-| 手机打开 **403** | profile 没配 `trustedHosts`，或域名写错。改完要**重启 DSH** |
+| 手机打开 **403** | 1.1.1 起正常不该出现（代理已改写 Host 为回环）。还报就走查：是不是旧版代理在跑、或绕过了代理直连域名 |
 | 手机打开 **502** | 代理活着但 DSH 桌面端没开 |
 | **证书错误** | HTTPS 没启用。跑一次不带 `--bg` 的 `tailscale serve` 走完同意流程 |
 | 手机打不开页面 | 手机 Tailscale 没开，或没登同一账号 |

@@ -66,12 +66,17 @@ try {
 }
 record('tailscale serve', serveWired, serveDetail);
 
-// ── 7. DSH profile 的信任白名单 ────────────────────────────────────────
+// ── 7. DSH profile 的信任白名单（1.1.1 起非必需，只作信息项） ───────────────
+// 代理会把转发给 DSH 的 Host 头改写成 127.0.0.1:<端口>，DSH 看到的是回环访问，
+// 因此不再需要把 ts.net 域名加进 trustedHosts —— 2026-10-20 在 0.2.1-rc.2 上实测不加也返回 200。
+// 以前这项判定为 ✗ 是误报（还会让人去改 cordis.patch.yml，而 0.2.1 下那条 web-runtime 覆盖会让 webRuntime 起不来）。
 const { hits, files } = checkTrustedHosts(AUTHORITY);
 record(
   'profile 信任白名单',
-  hits.length > 0,
-  hits.length > 0 ? `${hits.map((h) => h.profile).join(', ')} 已包含该域名` : `没找到（扫了 ${files.length} 个 profile）`
+  true,
+  hits.length > 0
+    ? `${hits.map((h) => h.profile).join(', ')} 已包含该域名`
+    : `不需要（代理已把 Host 改写为回环；扫了 ${files.length} 个 profile）`
 );
 
 // ── 8. Tailscale 控制平面连通性 ────────────────────────────────────────
@@ -183,17 +188,6 @@ const todo = [];
 if (!checks.find((c) => c.label.startsWith('DSH 桌面端'))?.ok) todo.push('先启动 DSH 桌面端（它是被访问的对象）');
 if (!checks.find((c) => c.label === 'tailscale serve')?.ok) {
   todo.push(`跑一次 tailscale serve --bg ${LISTEN_PORT}（或 node setup.mjs --serve）`);
-}
-if (!checks.find((c) => c.label === 'profile 信任白名单')?.ok) {
-  const target = files[0] ?? path.join(PROFILES_DIR, '<你的 profile>', 'cordis.patch.yml');
-  todo.push(
-    '把域名加进 DSH profile 的信任白名单（否则手机打开是 403）：\n' +
-      `      文件：${target}\n` +
-      '      在 web-runtime 条目下加（注意它和已有键同级、用 2 空格缩进）：\n' +
-      '        trustedHosts:\n' +
-      `          - ${AUTHORITY}\n` +
-      '      ⚠ patch 是整段替换 config，所以要连同 openBrowser / printUrl / surfaceContext 等已有键一起保留。'
-  );
 }
 if (!proxy.ok) todo.push('跑 start-proxy（或 node proxy.mjs）把代理启动起来');
 if (!checks.find((c) => c.label === 'Tailscale 控制平面')?.ok) {
