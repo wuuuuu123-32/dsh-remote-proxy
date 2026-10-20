@@ -148,8 +148,11 @@ DSH 远程访问自检
 全部就绪 ✓  手机打开：https://<机器名>.<tailnet>.ts.net/
 ```
 
-`check.mjs` 会实测四条：新手机（无 cookie）、残留旧 cookie、本机直连、对话的实时通道（WSS）。
-期望看到 `HTTP 200` + `set-cookie=有`，以及 `101 Switching Protocols`。
+`check.mjs` 会实测六条：新手机（无 cookie）、残留旧 cookie、本机直连、对话的实时通道（WSS）、
+数据面 `POST /api/session/list`、跨源 `Origin`。
+
+期望看到：前两条 `HTTP 200` + `set-cookie=有`；本机直连 `403`；WSS `101 Switching Protocols`；
+数据面 `200`（**403 就是「能打开页面、对话和数据全空」**）；跨源 `403`（200 / 502 都算漏洞）。
 
 ## 开机自启（Windows）
 
